@@ -192,6 +192,32 @@
         } finally {
           this.loading = false;
         }
+      },
+
+      async runDoctor() {
+        this.log = 'Running doctor...\n';
+        this.loading = true;
+
+        try {
+          const res = await fetch('/setup/api/doctor', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' }
+          });
+          const text = await res.text();
+          let j;
+          try { j = JSON.parse(text); } catch (_e) { j = { ok: false, output: text }; }
+          this.log += (j.output || JSON.stringify(j, null, 2));
+          if (j.ok) {
+            this.log += '\n✓ Doctor completed successfully\n';
+          } else {
+            this.log += '\n✗ Doctor found issues\n';
+          }
+        } catch (e) {
+          this.log += 'Error: ' + String(e) + '\n';
+        } finally {
+          this.loading = false;
+        }
       }
     }));
   });
@@ -234,18 +260,52 @@
         <h2 class="text-lg font-semibold mb-1">Setup Complete</h2>
         <p class="text-neutral-500 text-sm mb-6">Your OpenClaw instance is configured and running</p>
 
-        <div class="flex flex-wrap gap-3 mb-4">
-          <button @click="openPairingModal()" :disabled="loading" class="bg-neutral-100 dark:bg-neutral-800 hover:bg-neutral-200 dark:hover:bg-neutral-700 disabled:opacity-50 disabled:cursor-not-allowed text-neutral-700 dark:text-neutral-300 px-4 py-3 rounded-lg font-medium border border-neutral-300 dark:border-neutral-700 transition-colors">
-            Approve Pairing
-          </button>
-          <button @click="resetSetup()" :disabled="loading" class="text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-50 disabled:cursor-not-allowed px-4 py-3 rounded-lg font-medium transition-colors">
-            Reset Setup
-          </button>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+          <div class="flex flex-col bg-amber-50 dark:bg-amber-900/20 rounded-xl p-4 border border-amber-200 dark:border-amber-800">
+            <div class="flex items-center gap-3 mb-3">
+              <div class="w-10 h-10 bg-amber-500/20 rounded-lg flex items-center justify-center">
+                <svg class="w-5 h-5 text-amber-600 dark:text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+              </div>
+              <span class="font-medium text-amber-700 dark:text-amber-300">Run Doctor</span>
+            </div>
+            <p class="text-sm text-amber-600/80 dark:text-amber-400/70 flex-1">Performs health checks and repairs broken configuration. Creates a backup before making changes.</p>
+            <button @click="runDoctor()" :disabled="loading" class="w-full mt-4 bg-amber-100 dark:bg-amber-900/40 hover:bg-amber-200 dark:hover:bg-amber-900/60 disabled:opacity-50 disabled:cursor-not-allowed text-amber-700 dark:text-amber-300 px-4 py-2.5 rounded-lg font-medium border border-amber-300 dark:border-amber-700 transition-colors">
+              <span x-show="!loading">Run Doctor</span>
+              <span x-show="loading" class="flex items-center justify-center gap-2">
+                <svg class="animate-spin w-4 h-4" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                Running...
+              </span>
+            </button>
+          </div>
+
+          <div class="flex flex-col bg-blue-50 dark:bg-blue-900/20 rounded-xl p-4 border border-blue-200 dark:border-blue-800">
+            <div class="flex items-center gap-3 mb-3">
+              <div class="w-10 h-10 bg-blue-500/20 rounded-lg flex items-center justify-center">
+                <svg class="w-5 h-5 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/></svg>
+              </div>
+              <span class="font-medium text-blue-700 dark:text-blue-300">Approve Pairing</span>
+            </div>
+            <p class="text-sm text-blue-600/80 dark:text-blue-400/70 flex-1">Grant DM access to users who have requested pairing on Telegram or Discord.</p>
+            <button @click="openPairingModal()" :disabled="loading" class="w-full mt-4 bg-blue-100 dark:bg-blue-900/40 hover:bg-blue-200 dark:hover:bg-blue-900/60 disabled:opacity-50 disabled:cursor-not-allowed text-blue-700 dark:text-blue-300 px-4 py-2.5 rounded-lg font-medium border border-blue-300 dark:border-blue-700 transition-colors">
+              Approve Pairing
+            </button>
+          </div>
+
+          <div class="flex flex-col bg-red-50 dark:bg-red-900/20 rounded-xl p-4 border border-red-200 dark:border-red-800">
+            <div class="flex items-center gap-3 mb-3">
+              <div class="w-10 h-10 bg-red-500/20 rounded-lg flex items-center justify-center">
+                <svg class="w-5 h-5 text-red-600 dark:text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+              </div>
+              <span class="font-medium text-red-700 dark:text-red-300">Reset Setup</span>
+            </div>
+            <p class="text-sm text-red-600/80 dark:text-red-400/70 flex-1">Deletes the config file so you can run onboarding again from scratch.</p>
+            <button @click="resetSetup()" :disabled="loading" class="w-full mt-4 bg-red-100 dark:bg-red-900/40 hover:bg-red-200 dark:hover:bg-red-900/60 disabled:opacity-50 disabled:cursor-not-allowed text-red-700 dark:text-red-300 px-4 py-2.5 rounded-lg font-medium border border-red-300 dark:border-red-700 transition-colors">
+              Reset Setup
+            </button>
+          </div>
         </div>
 
         <div x-show="log" class="bg-neutral-100 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 rounded-lg p-4 font-mono text-xs text-neutral-600 dark:text-neutral-400 whitespace-pre-wrap max-h-64 overflow-y-auto" x-text="log"></div>
-
-        <p class="text-xs text-neutral-500 dark:text-neutral-600 mt-4">Reset deletes the config file so you can rerun onboarding. Pairing approval grants DM access when dmPolicy=pairing.</p>
       </div>
     </div>
 
