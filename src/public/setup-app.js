@@ -14,6 +14,9 @@
   var showAllAuthMethods = false;
 
   function renderAuth(groups) {
+    var prevGroup = authGroupEl.value;
+    var prevChoice = authChoiceEl.value;
+
     authGroupEl.innerHTML = '';
     for (var i = 0; i < groups.length; i++) {
       var g = groups[i];
@@ -74,7 +77,10 @@
       }
     };
 
+    // Restore previous selections if they still exist
+    if (prevGroup) authGroupEl.value = prevGroup;
     authGroupEl.onchange();
+    if (prevChoice) authChoiceEl.value = prevChoice;
 
     authChoiceEl.onchange = function () {
       var hint = document.getElementById('authSecretHint');
