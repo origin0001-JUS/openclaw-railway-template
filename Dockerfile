@@ -24,15 +24,22 @@ WORKDIR /openclaw
 # Falls back to v2026.2.15 if detection fails (ensures build reliability)
 # Can be overridden by passing --build-arg OPENCLAW_GIT_REF=<tag>
 ARG OPENCLAW_GIT_REF
-RUN set -eux; \
+RUN set -eu; \
   if [ -z "${OPENCLAW_GIT_REF:-}" ]; then \
     echo "🔍 Auto-detecting latest OpenClaw stable release..."; \
-    OPENCLAW_GIT_REF=$(git ls-remote --tags --sort=v:refname https://github.com/openclaw/openclaw.git | \
+    LATEST_TAG=$(git ls-remote --tags https://github.com/openclaw/openclaw.git | \
       grep -v '\^{}' | \
-      grep -E 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' | \
-      tail -1 | \
-      sed 's|.*refs/tags/||' || echo "v2026.2.15"); \
-    echo "✓ Auto-detected OpenClaw ${OPENCLAW_GIT_REF}"; \
+      grep 'refs/tags/v[0-9]' | \
+      sed 's|.*refs/tags/||' | \
+      sort -V | \
+      tail -1 || true); \
+    if [ -n "${LATEST_TAG}" ]; then \
+      OPENCLAW_GIT_REF="${LATEST_TAG}"; \
+      echo "✓ Auto-detected OpenClaw ${OPENCLAW_GIT_REF}"; \
+    else \
+      OPENCLAW_GIT_REF="v2026.2.15"; \
+      echo "⚠ Auto-detection failed, using fallback ${OPENCLAW_GIT_REF}"; \
+    fi; \
   else \
     echo "✓ Using pinned OpenClaw ${OPENCLAW_GIT_REF}"; \
   fi; \
