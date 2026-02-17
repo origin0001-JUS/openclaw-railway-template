@@ -1004,18 +1004,35 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
         clawArgs(["config", "set", "gateway.controlUi.allowInsecureAuth", "true"]),
       );
 
-      // Configure Railway reverse proxy trust (fixes X-Forwarded-* header handling)
-      // Railway's proxy sits at 127.0.0.1, so we trust that for accurate client IPs
-      await runCmd(
-        OPENCLAW_NODE,
-        clawArgs([
-          "config",
-          "set",
-          "--json",
-          "gateway.trustedProxies",
-          JSON.stringify(["127.0.0.1"]),
-        ]),
-      );
+      // Configure trusted proxies for gateway (based on PR #12 by ArtificialSight)
+      // - Auto-detects Railway environment via env vars
+      // - Security enhancement: Trust localhost only (not 0.0.0.0/0) since wrapper proxies all traffic
+      {
+        const isRailwayEnv =
+          !!process.env.RAILWAY_PROJECT_ID ||
+          !!process.env.RAILWAY_ENVIRONMENT ||
+          !!process.env.RAILWAY_STATIC_URL;
+        const trustAllProxies = process.env.OPENCLAW_TRUST_PROXY_ALL === "true";
+        
+        // Security: Even on Railway, only trust localhost since wrapper proxies all traffic through 127.0.0.1
+        // This is more secure than PR #12's original 0.0.0.0/0 while maintaining functionality
+        const trustedProxies = (isRailwayEnv || trustAllProxies)
+          ? ["127.0.0.1"]  // Enhanced from PR #12: was ["0.0.0.0/0"], now localhost only
+          : ["127.0.0.1/32"];
+
+        console.log(`[setup] Configuring trusted proxies: ${JSON.stringify(trustedProxies)} (Railway: ${isRailwayEnv})`);
+
+        await runCmd(
+          OPENCLAW_NODE,
+          clawArgs([
+            "config",
+            "set",
+            "--json",
+            "gateway.trustedProxies",
+            JSON.stringify(trustedProxies),
+          ]),
+        );
+      }
 
       // ========== CUSTOM PROVIDER CONFIGURATION ==========
       // Add custom OpenAI-compatible provider if provided

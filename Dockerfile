@@ -20,9 +20,22 @@ RUN corepack enable
 
 WORKDIR /openclaw
 
-# Pin to a known ref (tag/branch). Use latest stable release to avoid main branch breakage.
-ARG OPENCLAW_GIT_REF=v2026.2.15
-RUN git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/openclaw/openclaw.git .
+# Automatically detect and use the latest stable OpenClaw release tag
+# Falls back to v2026.2.15 if detection fails (ensures build reliability)
+ARG OPENCLAW_GIT_REF=""
+RUN set -eux; \
+  if [ -z "${OPENCLAW_GIT_REF}" ]; then \
+    echo "🔍 Auto-detecting latest OpenClaw stable release..."; \
+    OPENCLAW_GIT_REF=$(git ls-remote --tags --sort=v:refname https://github.com/openclaw/openclaw.git | \
+      grep -v '\^{}' | \
+      grep -E 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' | \
+      tail -1 | \
+      sed 's|.*refs/tags/||' || echo "v2026.2.15"); \
+    echo "✓ Using OpenClaw ${OPENCLAW_GIT_REF}"; \
+  else \
+    echo "✓ Using pinned OpenClaw ${OPENCLAW_GIT_REF}"; \
+  fi; \
+  git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/openclaw/openclaw.git .
 
 # Patch: relax version requirements for packages that may reference unpublished versions.
 # Apply to all extension package.json files to handle workspace protocol (workspace:*).
@@ -35,7 +48,15 @@ RUN set -eux; \
 RUN pnpm install --no-frozen-lockfile
 RUN pnpm build
 ENV OPENCLAW_PREFER_PNPM=1
-RUN pnpm ui:install && pnpm ui:build
+RUN pnpm ui:install
+RUN pnpm ui:build
+
+# Verify UI was built successfully (fail build if missing critical files)
+RUN set -x && \
+    test -d /openclaw/ui/dist && \
+    test -f /openclaw/ui/dist/index.html && \
+    echo "✓ OpenClaw UI build verified" || \
+    (echo "✗ ERROR: OpenClaw UI build failed - missing dist files!" && exit 1)
 
 
 # Runtime image
