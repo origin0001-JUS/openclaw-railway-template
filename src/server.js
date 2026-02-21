@@ -19,6 +19,14 @@ const WORKSPACE_DIR =
 
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 
+// Debug logging helper
+const DEBUG = process.env.OPENCLAW_TEMPLATE_DEBUG?.toLowerCase() === "true";
+function debug(...args) {
+  if (DEBUG) console.log(...args);
+}
+
+// Gateway admin token (protects Openclaw gateway + Control UI).
+// Must be stable across restarts. If not provided via env, persist it in the state dir.
 function resolveGatewayToken() {
   const envTok = process.env.OPENCLAW_GATEWAY_TOKEN?.trim();
   if (envTok) return envTok;
@@ -105,7 +113,14 @@ function isConfigured() {
 
 let gatewayProc = null;
 let gatewayStarting = null;
-let shuttingDown = false;
+let gatewayHealthy = false;  // Track if gateway responded to health check
+let shuttingDown = false;    // Set true on SIGTERM/SIGINT to suppress auto-restart
+
+// Debug breadcrumbs for common Railway failures (502 / "Application failed to respond").
+let lastGatewayError = null;
+let lastGatewayExit = null;
+let lastDoctorOutput = null;
+let lastDoctorAt = null;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -148,6 +163,7 @@ async function startGateway() {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
 
+  // Clean up stale lock files before spawning to prevent startup failures
   for (const lockPath of [
     path.join(STATE_DIR, "gateway.lock"),
     "/tmp/openclaw-gateway.lock",
@@ -155,6 +171,22 @@ async function startGateway() {
     try {
       fs.rmSync(lockPath, { force: true });
     } catch {}
+  }
+
+  // Sync wrapper token to openclaw.json before every gateway start.
+  // This ensures the gateway's config-file token matches what the wrapper injects via proxy.
+  console.log(`[gateway] ========== GATEWAY START TOKEN SYNC ==========`);
+  console.log(`[gateway] Syncing wrapper token to config (length: ${OPENCLAW_GATEWAY_TOKEN.length})`);
+  debug(`[gateway] Token preview: ${OPENCLAW_GATEWAY_TOKEN.slice(0, 16)}...`);
+
+  const syncResult = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]),
+  );
+
+  console.log(`[gateway] Sync result: exit code ${syncResult.code}`);
+  if (syncResult.output?.trim()) {
+    console.log(`[gateway] Sync output: ${syncResult.output}`);
   }
 
   const args = [
@@ -192,12 +224,15 @@ async function startGateway() {
 
   gatewayProc.on("error", (err) => {
     console.error(`[gateway] spawn error: ${String(err)}`);
+    lastGatewayError = String(err);
     gatewayProc = null;
   });
 
   gatewayProc.on("exit", (code, signal) => {
     console.error(`[gateway] exited code=${code} signal=${signal}`);
+    lastGatewayExit = { code, signal, at: new Date().toISOString() };
     gatewayProc = null;
+    gatewayHealthy = false;
     if (!shuttingDown && isConfigured()) {
       console.log("[gateway] scheduling auto-restart in 2s...");
       setTimeout(() => {
@@ -250,6 +285,7 @@ async function restartGateway() {
   return ensureGatewayRunning();
 }
 
+// ========== PER-IP RATE LIMITER (sliding window, no external deps) ==========
 const setupRateLimiter = {
   attempts: new Map(),
   windowMs: 60_000,
@@ -309,10 +345,50 @@ function requireSetupAuth(req, res, next) {
   return next();
 }
 
+async function probeGateway() {
+  // Don't assume HTTP — the gateway primarily speaks WebSocket.
+  // A simple TCP connect check is enough for "is it up".
+  const net = await import("node:net");
+
+  return await new Promise((resolve) => {
+    const sock = net.createConnection({
+      host: INTERNAL_GATEWAY_HOST,
+      port: INTERNAL_GATEWAY_PORT,
+      timeout: 750,
+    });
+
+    const done = (ok) => {
+      try { sock.destroy(); } catch {}
+      resolve(ok);
+    };
+
+    sock.on("connect", () => done(true));
+    sock.on("timeout", () => done(false));
+    sock.on("error", () => done(false));
+  });
+}
+
+// Load loading.html once at startup for use in proxy error responses
+let loadingHtmlContent = null;
+try {
+  loadingHtmlContent = fs.readFileSync(
+    path.join(process.cwd(), "src", "public", "loading.html"),
+    "utf8",
+  );
+} catch {
+  // Fallback inline if file missing
+  loadingHtmlContent = `<!DOCTYPE html><html><head><meta http-equiv="refresh" content="5"/><title>Starting</title></head><body><p>OpenClaw is starting. This page will refresh automatically.</p></body></html>`;
+}
+
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 
+// Minimal health endpoint for Railway.
+app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
+
+// Public health endpoint (no auth) so Railway can probe without /setup.
+// Keep this free of secrets.
 app.get("/healthz", async (_req, res) => {
   let gateway = "unconfigured";
   if (isConfigured()) {
@@ -730,97 +806,48 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
   }
 });
 
-app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
-  const v = await runCmd(OPENCLAW_NODE, clawArgs(["--version"]));
-  const help = await runCmd(
-    OPENCLAW_NODE,
-    clawArgs(["channels", "add", "--help"]),
-  );
-  res.json({
-    wrapper: {
-      node: process.version,
-      port: PORT,
-      stateDir: STATE_DIR,
-      workspaceDir: WORKSPACE_DIR,
-      configPath: configPath(),
-      gatewayTokenFromEnv: Boolean(process.env.OPENCLAW_GATEWAY_TOKEN?.trim()),
-      gatewayTokenPersisted: fs.existsSync(
-        path.join(STATE_DIR, "gateway.token"),
-      ),
-      railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || null,
-    },
-    openclaw: {
-      entry: OPENCLAW_ENTRY,
-      node: OPENCLAW_NODE,
-      version: v.output.trim(),
-      channelsAddHelpIncludesTelegram: help.output.includes("telegram"),
-    },
-  });
-});
+function redactSecrets(text) {
+  if (!text) return text;
+  // Very small best-effort redaction. (Config paths/values may still contain secrets.)
+  return String(text)
+    .replace(/(sk-[A-Za-z0-9_-]{10,})/g, "[REDACTED]")
+    .replace(/(gho_[A-Za-z0-9_]{10,})/g, "[REDACTED]")
+    .replace(/(xox[baprs]-[A-Za-z0-9-]{10,})/g, "[REDACTED]")
+    // Telegram bot tokens look like: 123456:ABCDEF...
+    .replace(/(\d{5,}:[A-Za-z0-9_-]{10,})/g, "[REDACTED]")
+    .replace(/(AA[A-Za-z0-9_-]{10,}:\S{10,})/g, "[REDACTED]");
+}
 
-app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
-  const { channel, code } = req.body || {};
-  if (!channel || !code) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "Missing channel or code" });
-  }
-  const r = await runCmd(
-    OPENCLAW_NODE,
-    clawArgs(["pairing", "approve", String(channel), String(code)]),
-  );
-  return res
-    .status(r.code === 0 ? 200 : 500)
-    .json({ ok: r.code === 0, output: r.output });
-});
-
-app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
-  try {
-    fs.rmSync(configPath(), { force: true });
-    res
-      .type("text/plain")
-      .send("OK - deleted config file. You can rerun setup now.");
-  } catch (err) {
-    res.status(500).type("text/plain").send(String(err));
-  }
-});
-
-app.post("/setup/api/doctor", requireSetupAuth, async (_req, res) => {
-  const args = ["doctor", "--non-interactive", "--repair"];
-  const result = await runCmd(OPENCLAW_NODE, clawArgs(args));
-  return res.status(result.code === 0 ? 200 : 500).json({
-    ok: result.code === 0,
-    output: result.output,
-  });
-});
-
-app.get("/tui", requireSetupAuth, (_req, res) => {
-  if (!ENABLE_WEB_TUI) {
-    return res
-      .status(403)
-      .type("text/plain")
-      .send("Web TUI is disabled. Set ENABLE_WEB_TUI=true to enable it.");
-  }
-  if (!isConfigured()) {
-    return res.redirect("/setup");
-  }
-  res.sendFile(path.join(process.cwd(), "src", "public", "tui.html"));
-});
-
-let activeTuiSession = null;
+// ========== WEB TUI: AUTH + SESSION MANAGEMENT ==========
 
 function verifyTuiAuth(req) {
   if (!SETUP_PASSWORD) return false;
-  const header = req.headers.authorization || "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) return false;
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  const passwordHash = crypto.createHash("sha256").update(password).digest();
-  const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
-  return crypto.timingSafeEqual(passwordHash, expectedHash);
+  // Check Authorization header (Basic auth)
+  const authHeader = req.headers["authorization"] || "";
+  if (authHeader.startsWith("Basic ")) {
+    const decoded = Buffer.from(authHeader.slice(6), "base64").toString("utf8");
+    const password = decoded.includes(":") ? decoded.split(":").slice(1).join(":") : decoded;
+    const passwordHash = crypto.createHash("sha256").update(password).digest();
+    const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
+    if (crypto.timingSafeEqual(passwordHash, expectedHash)) return true;
+  }
+  // Check WebSocket subprotocol for browser clients (browsers can't set custom headers)
+  const protocols = (req.headers["sec-websocket-protocol"] || "").split(",").map(s => s.trim());
+  for (const proto of protocols) {
+    if (proto.startsWith("auth-")) {
+      try {
+        const decoded = Buffer.from(proto.slice(5), "base64").toString("utf8");
+        const password = decoded.includes(":") ? decoded.split(":").slice(1).join(":") : decoded;
+        const passwordHash = crypto.createHash("sha256").update(password).digest();
+        const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
+        if (crypto.timingSafeEqual(passwordHash, expectedHash)) return true;
+      } catch { /* invalid base64 */ }
+    }
+  }
+  return false;
 }
+
+let activeTuiSession = null;
 
 function createTuiWebSocketServer(httpServer) {
   const wss = new WebSocketServer({ noServer: true });
@@ -936,6 +963,289 @@ function createTuiWebSocketServer(httpServer) {
   return wss;
 }
 
+// ========== DEBUG CONSOLE: HELPER FUNCTIONS & ALLOWLIST ==========
+
+// Extract device requestIds from device list output for validation
+function extractDeviceRequestIds(output) {
+  const ids = [];
+  const lines = (output || "").split("\n");
+  // Look for lines with requestId format: alphanumeric, underscore, dash
+  for (const line of lines) {
+    const match = line.match(/requestId[:\s]+([A-Za-z0-9_-]+)/i);
+    if (match) ids.push(match[1]);
+  }
+  return ids;
+}
+
+// Allowlisted commands for debug console (security-critical: no arbitrary shell execution)
+const ALLOWED_CONSOLE_COMMANDS = new Set([
+  // Gateway lifecycle (wrapper-managed, no openclaw CLI needed)
+  "gateway.restart",
+  "gateway.stop",
+  "gateway.start",
+
+  // OpenClaw CLI commands (all safe, read-only or user-controlled)
+  "openclaw.version",
+  "openclaw.status",
+  "openclaw.health",
+  "openclaw.doctor",
+  "openclaw.logs.tail",
+  "openclaw.config.get",
+  "openclaw.devices.list",
+  "openclaw.devices.approve",
+  "openclaw.plugins.list",
+  "openclaw.plugins.enable",
+]);
+
+// Debug console command handler (POST /setup/api/console/run)
+app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
+  try {
+    const { command, arg } = req.body || {};
+
+    // Validate command is allowlisted
+    if (!command || !ALLOWED_CONSOLE_COMMANDS.has(command)) {
+      return res.status(400).json({
+        ok: false,
+        error: `Command not allowed: ${command || "(empty)"}`,
+      });
+    }
+
+    let result;
+
+    // Gateway lifecycle commands (wrapper-managed, no openclaw CLI)
+    if (command === "gateway.restart") {
+      await restartGateway();
+      result = { code: 0, output: "Gateway restarted successfully\n" };
+    } else if (command === "gateway.stop") {
+      if (gatewayProc) {
+        gatewayProc.kill("SIGTERM");
+        gatewayProc = null;
+        result = { code: 0, output: "Gateway stopped\n" };
+      } else {
+        result = { code: 0, output: "Gateway not running\n" };
+      }
+    } else if (command === "gateway.start") {
+      await ensureGatewayRunning();
+      result = { code: 0, output: "Gateway started successfully\n" };
+    }
+
+    // OpenClaw CLI commands
+    else if (command === "openclaw.version") {
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["--version"]));
+    } else if (command === "openclaw.status") {
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["status"]));
+    } else if (command === "openclaw.health") {
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["health"]));
+    } else if (command === "openclaw.doctor") {
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["doctor"]));
+    } else if (command === "openclaw.logs.tail") {
+      // arg is the tail count (default 50)
+      const count = arg?.trim() || "50";
+      if (!/^\d+$/.test(count)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Invalid tail count (must be a number)",
+        });
+      }
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["logs", "--tail", count]));
+    } else if (command === "openclaw.config.get") {
+      // arg is the config path (e.g., "gateway.port")
+      const cfgPath = arg?.trim();
+      if (!cfgPath) {
+        return res.status(400).json({
+          ok: false,
+          error: "Config path required (e.g., gateway.port)",
+        });
+      }
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", cfgPath]));
+    } else if (command === "openclaw.devices.list") {
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "list"]));
+    } else if (command === "openclaw.devices.approve") {
+      // arg is the device requestId
+      const requestId = arg?.trim();
+      if (!requestId) {
+        return res.status(400).json({
+          ok: false,
+          error: "Device requestId required",
+        });
+      }
+      // Validate requestId format (alphanumeric, underscore, dash)
+      if (!/^[A-Za-z0-9_-]+$/.test(requestId)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Invalid requestId format (alphanumeric, underscore, dash only)",
+        });
+      }
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "approve", requestId]));
+    } else if (command === "openclaw.plugins.list") {
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "list"]));
+    } else if (command === "openclaw.plugins.enable") {
+      // arg is the plugin name
+      const pluginName = arg?.trim();
+      if (!pluginName) {
+        return res.status(400).json({
+          ok: false,
+          error: "Plugin name required",
+        });
+      }
+      // Validate plugin name format (alphanumeric, underscore, dash)
+      if (!/^[A-Za-z0-9_-]+$/.test(pluginName)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Invalid plugin name format (alphanumeric, underscore, dash only)",
+        });
+      }
+      result = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", pluginName]));
+    } else {
+      // Should never reach here due to allowlist check
+      return res.status(500).json({
+        ok: false,
+        error: "Internal error: command allowlisted but not implemented",
+      });
+    }
+
+    // Apply secret redaction to all output
+    const output = redactSecrets(result.output || "");
+
+    return res.json({
+      ok: result.code === 0,
+      output,
+      exitCode: result.code,
+    });
+  } catch (err) {
+    console.error("[/setup/api/console/run] error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: `Internal error: ${String(err)}`,
+    });
+  }
+});
+
+app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
+  const v = await runCmd(OPENCLAW_NODE, clawArgs(["--version"]));
+  const help = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs(["channels", "add", "--help"]),
+  );
+  res.json({
+    wrapper: {
+      node: process.version,
+      port: PORT,
+      stateDir: STATE_DIR,
+      workspaceDir: WORKSPACE_DIR,
+      configPath: configPath(),
+      gatewayTokenFromEnv: Boolean(process.env.OPENCLAW_GATEWAY_TOKEN?.trim()),
+      gatewayTokenPersisted: fs.existsSync(
+        path.join(STATE_DIR, "gateway.token"),
+      ),
+      railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || null,
+    },
+    openclaw: {
+      entry: OPENCLAW_ENTRY,
+      node: OPENCLAW_NODE,
+      version: v.output.trim(),
+      channelsAddHelpIncludesTelegram: help.output.includes("telegram"),
+    },
+  });
+});
+
+app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
+  const { channel, code } = req.body || {};
+  if (!channel || !code) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Missing channel or code" });
+  }
+  const r = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs(["pairing", "approve", String(channel), String(code)]),
+  );
+  return res
+    .status(r.code === 0 ? 200 : 500)
+    .json({ ok: r.code === 0, output: r.output });
+});
+
+app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
+  try {
+    fs.rmSync(configPath(), { force: true });
+    res
+      .type("text/plain")
+      .send("OK - deleted config file. You can rerun setup now.");
+  } catch (err) {
+    res.status(500).type("text/plain").send(String(err));
+  }
+});
+
+app.post("/setup/api/doctor", requireSetupAuth, async (_req, res) => {
+  const args = ["doctor", "--non-interactive", "--repair"];
+  const result = await runCmd(OPENCLAW_NODE, clawArgs(args));
+  return res.status(result.code === 0 ? 200 : 500).json({
+    ok: result.code === 0,
+    output: result.output,
+  });
+});
+
+// ========== WEB TUI ROUTE ==========
+app.get("/tui", requireSetupAuth, (_req, res) => {
+  if (!ENABLE_WEB_TUI) {
+    return res
+      .status(403)
+      .type("text/plain")
+      .send("Web TUI is disabled. Set ENABLE_WEB_TUI=true to enable it.");
+  }
+  if (!isConfigured()) {
+    return res.redirect("/setup");
+  }
+  res.sendFile(path.join(process.cwd(), "src", "public", "tui.html"));
+});
+
+app.get("/setup/export", requireSetupAuth, async (_req, res) => {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+
+  res.setHeader("content-type", "application/gzip");
+  res.setHeader(
+    "content-disposition",
+    `attachment; filename="openclaw-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.tar.gz"`,
+  );
+
+  // Prefer exporting from a common /data root so archives are easy to inspect and restore.
+  // This preserves dotfiles like /data/.openclaw/openclaw.json.
+  const stateAbs = path.resolve(STATE_DIR);
+  const workspaceAbs = path.resolve(WORKSPACE_DIR);
+
+  const dataRoot = "/data";
+  const underData = (p) => p === dataRoot || p.startsWith(dataRoot + path.sep);
+
+  let cwd = "/";
+  let paths = [stateAbs, workspaceAbs].map((p) => p.replace(/^\//, ""));
+
+  if (underData(stateAbs) && underData(workspaceAbs)) {
+    cwd = dataRoot;
+    // We export relative to /data so the archive contains: .openclaw/... and workspace/...
+    paths = [
+      path.relative(dataRoot, stateAbs) || ".",
+      path.relative(dataRoot, workspaceAbs) || ".",
+    ];
+  }
+
+  const tar = childProcess.spawn(
+    "tar",
+    ["-czf", "-", "--dereference", ...paths],
+    { cwd, stdio: ["ignore", "pipe", "pipe"] },
+  );
+
+  tar.stderr.on("data", (d) =>
+    console.warn("[export] tar stderr:", d.toString()),
+  );
+  tar.on("error", (err) => {
+    console.error("[export] tar error:", err);
+    if (!res.headersSent) res.status(500).end();
+  });
+
+  tar.stdout.pipe(res);
+});
+
 const proxy = httpProxy.createProxyServer({
   target: GATEWAY_TARGET,
   ws: true,
@@ -944,6 +1254,8 @@ const proxy = httpProxy.createProxyServer({
   timeout: 120_000,
 });
 
+// Prevent proxy errors from crashing the wrapper.
+// Common errors: ECONNREFUSED (gateway not ready), ECONNRESET (client disconnect).
 proxy.on("error", (err, _req, res) => {
   console.error("[proxy]", err);
   if (res && typeof res.headersSent !== "undefined" && !res.headersSent) {
@@ -966,6 +1278,22 @@ proxy.on("proxyReq", (proxyReq, req, res) => {
 
 proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
   proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
+});
+
+// Auto-inject token into /openclaw browser GET requests so the Control UI works
+// without the user needing to know the gateway token.
+app.use((req, res, next) => {
+  if (
+    req.method === "GET" &&
+    (req.path === "/openclaw" || req.path.startsWith("/openclaw/")) &&
+    !req.query.token &&
+    !req.headers.authorization &&
+    !req.headers.upgrade // not a WebSocket upgrade
+  ) {
+    const sep = req.url.includes("?") ? "&" : "?";
+    return res.redirect(307, `${req.url}${sep}token=${encodeURIComponent(OPENCLAW_GATEWAY_TOKEN)}`);
+  }
+  return next();
 });
 
 app.use(async (req, res) => {
@@ -1004,6 +1332,19 @@ const server = app.listen(PORT, () => {
   console.log(`[wrapper] web TUI: ${ENABLE_WEB_TUI ? "enabled" : "disabled"}`);
   console.log(`[wrapper] configured: ${isConfigured()}`);
 
+  // Harden state dir for OpenClaw and avoid missing credentials dir on fresh volumes.
+  try {
+    fs.mkdirSync(path.join(STATE_DIR, "credentials"), { recursive: true, mode: 0o700 });
+  } catch {}
+  try {
+    fs.chmodSync(STATE_DIR, 0o700);
+  } catch {}
+  try {
+    fs.chmodSync(path.join(STATE_DIR, "credentials"), 0o700);
+  } catch {}
+
+  // Auto-start the gateway if already configured so polling channels (Telegram/Discord/etc.)
+  // work even if nobody visits the web UI.
   if (isConfigured()) {
     (async () => {
       try {
@@ -1076,7 +1417,7 @@ async function gracefulShutdown(signal) {
   if (activeTuiSession) {
     try {
       activeTuiSession.ws.close(1001, "Server shutting down");
-      activeTuiSession.pty.kill();
+      if (activeTuiSession.pty) activeTuiSession.pty.kill();
     } catch {}
     activeTuiSession = null;
   }
