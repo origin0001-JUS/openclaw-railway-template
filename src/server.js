@@ -155,10 +155,9 @@ const AUTH_GROUPS = [
   {
     value: "anthropic",
     label: "Anthropic",
-    hint: "Claude Code CLI + API key",
+    hint: "Claude Max setup-token + API key",
     options: [
-      { value: "claude-cli", label: "Anthropic token (Claude Code CLI)" },
-      { value: "token", label: "Anthropic token (paste setup-token)" },
+      { value: "token", label: "Claude Max / Pro (setup-token)" },
       { value: "apiKey", label: "Anthropic API key" },
     ],
   },
@@ -793,8 +792,14 @@ function buildOnboardArgs(payload) {
     payload.flow || "quickstart",
   ];
 
-  if (payload.authChoice) {
-    args.push("--auth-choice", payload.authChoice);
+  // Remap deprecated auth choices
+  let authChoice = payload.authChoice;
+  if (authChoice === "claude-cli") {
+    authChoice = "token";
+  }
+
+  if (authChoice) {
+    args.push("--auth-choice", authChoice);
 
     // Map secret to correct flag for common choices.
     const secret = (payload.authSecret || "").trim();
@@ -842,13 +847,13 @@ function buildOnboardArgs(payload) {
       "synthetic-api-key": "--synthetic-api-key",
       "opencode-zen": "--opencode-zen-api-key",
     };
-    const flag = map[payload.authChoice];
+    const flag = map[authChoice];
     if (flag && secret) {
       args.push(flag, secret);
     }
 
-    if (payload.authChoice === "token" && secret) {
-      // This is the Anthropics setup-token flow.
+    if (authChoice === "token") {
+      if (!secret) throw new Error("Missing setup-token for Claude Max auth. Run 'claude setup-token' in your terminal and paste the result.");
       args.push("--token-provider", "anthropic", "--token", secret);
     }
   }

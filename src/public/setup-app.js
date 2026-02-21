@@ -14,6 +14,9 @@
   var showAllAuthMethods = false;
 
   function renderAuth(groups) {
+    var prevGroup = authGroupEl.value;
+    var prevChoice = authChoiceEl.value;
+
     authGroupEl.innerHTML = '';
     for (var i = 0; i < groups.length; i++) {
       var g = groups[i];
@@ -74,7 +77,22 @@
       }
     };
 
+    // Restore previous selections if they still exist
+    if (prevGroup) authGroupEl.value = prevGroup;
     authGroupEl.onchange();
+    if (prevChoice) authChoiceEl.value = prevChoice;
+
+    authChoiceEl.onchange = function () {
+      var hint = document.getElementById('authSecretHint');
+      if (!hint) return;
+      if (authChoiceEl.value === 'token') {
+        hint.textContent = 'Run "claude setup-token" in your terminal and paste the result. The token is NOT in sk-ant-... format.';
+      } else if (authChoiceEl.value === 'apiKey') {
+        hint.textContent = 'Paste your Anthropic API key (starts with sk-ant-...) from console.anthropic.com.';
+      } else {
+        hint.textContent = '';
+      }
+    };
   }
 
   // Handle "Show all auth methods" selection
