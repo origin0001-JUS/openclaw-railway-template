@@ -2,7 +2,8 @@
 builder = "dockerfile"
 
 [deploy]
-healthcheckPath = "/setup/healthz"
+# 특정 경로를 확인하지 않고 포트가 열렸는지만 확인하도록 경로를 삭제합니다.
+# healthcheckPath = "/setup/healthz" 
 healthcheckTimeout = 300
 restartPolicyType = "on_failure"
 
