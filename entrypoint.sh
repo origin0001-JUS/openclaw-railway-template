@@ -1,9 +1,9 @@
 #!/bin/bash
 set -e
 
-# Ensure /data is owned by openclaw user and has restricted permissions
-chown openclaw:openclaw /data 2>/dev/null || true
-chmod 700 /data 2>/dev/null || true
+# [수정됨] -R 옵션을 추가하여 하위 폴더까지 모든 권한을 강제로 부여합니다.
+chown -R openclaw:openclaw /data 2>/dev/null || true
+chmod -R 700 /data 2>/dev/null || true
 
 # Persist Homebrew to Railway volume so it survives container rebuilds
 BREW_VOLUME="/data/.linuxbrew"
