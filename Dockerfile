@@ -88,6 +88,7 @@ RUN pnpm ui:install && pnpm ui:build
 FROM node:22-bookworm
 ENV NODE_ENV=production
 
+# [수정] 실행 환경에 브라우저와 필수 라이브러리 설치
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -97,7 +98,13 @@ RUN apt-get update \
     procps \
     python3 \
     build-essential \
+    chromium \
+    fonts-ipafont-gothic fonts-wqy-zenhei fonts-thai-tlwg fonts-kacst fonts-freefont-ttf libxss1 \
   && rm -rf /var/lib/apt/lists/*
+
+# [추가] 브라우저 경로 설정
+ENV CHROME_PATH=/usr/bin/chromium
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
 WORKDIR /app
 
